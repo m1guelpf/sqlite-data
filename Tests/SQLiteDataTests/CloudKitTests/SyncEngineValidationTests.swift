@@ -325,16 +325,52 @@
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
-      @Test func cycleValidation() async throws {
+      @Test func selfReferentialTablesAllowed() async throws {
+        let database = try DatabaseQueue()
+        try await database.write { db in
+          try #sql(
+            """
+            CREATE TABLE "recursiveTables" (
+              "id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+              "parentID" INTEGER REFERENCES "recursiveTables"("id") ON DELETE CASCADE
+            ) STRICT
+            """
+          )
+          .execute(db)
+        }
+        let syncEngine = try await SyncEngine(
+          container: MockCloudContainer(
+            containerIdentifier: "deadbeef",
+            privateCloudDatabase: MockCloudDatabase(databaseScope: .private),
+            sharedCloudDatabase: MockCloudDatabase(databaseScope: .shared)
+          ),
+          userDatabase: UserDatabase(database: database),
+          tables: RecursiveTable.self
+        )
+
+        #expect(syncEngine.isRunning)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func crossTableCyclesNotAllowed() async throws {
         let error = try #require(
           await #expect(throws: (any Error).self) {
             let database = try DatabaseQueue()
             try await database.write { db in
               try #sql(
                 """
-                CREATE TABLE "recursiveTables" (
+                CREATE TABLE "tableAs" (
                   "id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-                  "parentID" INTEGER REFERENCES "recursiveTables"("id")
+                  "tableBID" INTEGER REFERENCES "tableBs"("id") ON DELETE CASCADE
+                ) STRICT
+                """
+              )
+              .execute(db)
+              try #sql(
+                """
+                CREATE TABLE "tableBs" (
+                  "id" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                  "tableAID" INTEGER REFERENCES "tableAs"("id") ON DELETE CASCADE
                 ) STRICT
                 """
               )
@@ -347,7 +383,10 @@
                 sharedCloudDatabase: MockCloudDatabase(databaseScope: .shared)
               ),
               userDatabase: UserDatabase(database: database),
-              tables: RecursiveTable.self
+              tables: [
+                SynchronizedTable(for: TableA.self),
+                SynchronizedTable(for: TableB.self),
+              ]
             )
           }
         )
@@ -360,7 +399,7 @@
           """
           SyncEngine.SchemaError(
             reason: .cycleDetected,
-            debugDescription: "Cycles are not currently permitted in schemas, e.g. a table that references itself."
+            debugDescription: "Cross-table cycles are not currently permitted in schemas."
           )
           """
         }
@@ -371,5 +410,15 @@
   @Table struct RecursiveTable: Identifiable {
     let id: Int
     let parentID: RecursiveTable.ID?
+  }
+
+  @Table struct TableA: Identifiable {
+    let id: Int
+    let tableBID: TableB.ID?
+  }
+
+  @Table struct TableB: Identifiable {
+    let id: Int
+    let tableAID: TableA.ID?
   }
 #endif

@@ -931,6 +931,20 @@
     }
   }
 
+  private func parentForeignKey(
+    for tableName: String,
+    foreignKeysByTableName: [String: [ForeignKey]]
+  ) -> ForeignKey? {
+    guard let foreignKeys = foreignKeysByTableName[tableName], !foreignKeys.isEmpty
+    else { return nil }
+
+    if foreignKeys.count == 1 {
+      return foreignKeys.first
+    }
+
+    return foreignKeys.first { $0.table == tableName }
+  }
+
   extension PrimaryKeyedTable {
     @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
     fileprivate static func createTriggers(
@@ -940,10 +954,10 @@
       privateTables: [any SynchronizableTable],
       db: Database
     ) throws {
-      let parentForeignKey =
-        foreignKeysByTableName[tableName]?.count == 1
-        ? foreignKeysByTableName[tableName]?.first
-        : nil
+      let parentForeignKey = SQLiteData.parentForeignKey(
+        for: tableName,
+        foreignKeysByTableName: foreignKeysByTableName
+      )
 
       for trigger in metadataTriggers(
         parentForeignKey: parentForeignKey,
@@ -1567,25 +1581,29 @@
         )
       }
 
-      enum ShareOrReference {
-        case share(CKShare)
-        case reference(CKShare.Reference)
+      let hasSelfReferentialRecords = modifications.contains { record in
+        guard let foreignKeys = foreignKeysByTableName[record.recordType] else { return false }
+        return foreignKeys.contains { $0.table == record.recordType }
       }
+
       let shares: [ShareOrReference] =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
-          try await userDatabase.write { db in
-            var shares: [ShareOrReference] = []
-            for record in modifications {
-              if let share = record as? CKShare {
-                shares.append(.share(share))
-              } else {
-                upsertFromServerRecord(record, db: db)
-                if let shareReference = record.share {
-                  shares.append(.reference(shareReference))
-                }
+          if hasSelfReferentialRecords {
+            do {
+              return try await userDatabase.write { db in
+                try #sql("PRAGMA defer_foreign_keys = ON").execute(db)
+                return try processModifications(modifications, into: db)
+              }
+            } catch let error as DatabaseError where error.resultCode == .SQLITE_CONSTRAINT {
+              let sortedModifications = sortRecordsForDependencyOrder(modifications)
+              return try await userDatabase.write { db in
+                try processModifications(sortedModifications, into: db)
               }
             }
-            return shares
+          } else {
+            return try await userDatabase.write { db in
+              try processModifications(modifications, into: db)
+            }
           }
         }
         ?? []
@@ -1610,6 +1628,82 @@
           }
         }
       }
+    }
+
+    private func sortRecordsForDependencyOrder(_ records: [CKRecord]) -> [CKRecord] {
+      return records.sorted { lhs, rhs in
+        guard lhs.recordType == rhs.recordType else {
+          return topologicallyAscending(
+            lhsTableName: lhs.recordType,
+            rhsTableName: rhs.recordType,
+            rootFirst: true
+          )
+        }
+
+        let parentFK = parentForeignKey(
+          for: lhs.recordType,
+          foreignKeysByTableName: foreignKeysByTableName
+        )
+
+        func parentRecordID(of record: CKRecord) -> CKRecord.ID? {
+          if let parentID = record.parent?.recordID {
+            return parentID
+          }
+
+          guard let parentFK = parentFK else { return nil }
+          guard let parentIDValue = record.encryptedValues[parentFK.from] as? String
+          else { return nil }
+
+          let parentRecordName = "\(parentIDValue):\(record.recordType)"
+          return CKRecord.ID(
+            recordName: parentRecordName,
+            zoneID: record.recordID.zoneID
+          )
+        }
+
+        let lhsParent = parentRecordID(of: lhs)
+        let rhsParent = parentRecordID(of: rhs)
+
+        switch (lhsParent, rhsParent) {
+        case (nil, nil):
+          return lhs.recordID.recordName < rhs.recordID.recordName
+        case (nil, _):
+          return true
+        case (_, nil):
+          return false
+        case (let lhsParent?, let rhsParent?):
+          if lhsParent == rhs.recordID {
+            return false
+          }
+          if rhsParent == lhs.recordID {
+            return true
+          }
+          return lhs.recordID.recordName < rhs.recordID.recordName
+        }
+      }
+    }
+
+    private enum ShareOrReference {
+      case share(CKShare)
+      case reference(CKShare.Reference)
+    }
+
+    private func processModifications(
+      _ modifications: [CKRecord],
+      into db: Database
+    ) throws -> [ShareOrReference] {
+      var shares: [ShareOrReference] = []
+      for record in modifications {
+        if let share = record as? CKShare {
+          shares.append(.share(share))
+        } else {
+          upsertFromServerRecord(record, db: db)
+          if let shareReference = record.share {
+            shares.append(.reference(shareReference))
+          }
+        }
+      }
+      return shares
     }
 
     private func topologicallyAscending(
@@ -1685,8 +1779,10 @@
           guard
             let recordPrimaryKey = failedRecord.recordID.recordPrimaryKey,
             let table = tablesByName[failedRecord.recordType],
-            foreignKeysByTableName[table.base.tableName]?.count == 1,
-            let foreignKey = foreignKeysByTableName[table.base.tableName]?.first
+            let foreignKey = parentForeignKey(
+              for: table.base.tableName,
+              foreignKeysByTableName: foreignKeysByTableName
+            )
           else {
             continue
           }
@@ -1939,9 +2035,10 @@
               with: allFields,
               row: T(queryOutput: row),
               columnNames: &columnNames,
-              parentForeignKey: foreignKeysByTableName[T.tableName]?.count == 1
-                ? foreignKeysByTableName[T.tableName]?.first
-                : nil
+              parentForeignKey: parentForeignKey(
+                for: T.tableName,
+                foreignKeysByTableName: foreignKeysByTableName
+              )
             )
           }
 
@@ -2287,19 +2384,21 @@
                 \(tableName.debugDescription).\(invalidForeignKey.from.debugDescription) \
                 references table \(invalidForeignKey.table.debugDescription) that is not \
                 synchronized. Update 'SyncEngine.init' to synchronize \
-                \(invalidForeignKey.table.debugDescription). 
+                \(invalidForeignKey.table.debugDescription).
                 """
             )
           }
 
-          if foreignKeys.count == 1,
-            let foreignKey = foreignKeys.first,
-            [.restrict, .noAction].contains(foreignKey.onDelete)
+          if let parentForeignKey = parentForeignKey(
+            for: tableName,
+            foreignKeysByTableName: foreignKeysByTableName
+          ),
+            [.restrict, .noAction].contains(parentForeignKey.onDelete)
           {
             throw SyncEngine.SchemaError(
-              reason: .invalidForeignKeyAction(foreignKey),
+              reason: .invalidForeignKeyAction(parentForeignKey),
               debugDescription: """
-                Foreign key \(tableName.debugDescription).\(foreignKey.from.debugDescription) \
+                Foreign key \(tableName.debugDescription).\(parentForeignKey.from.debugDescription) \
                 action not supported. Must be 'CASCADE', 'SET DEFAULT' or 'SET NULL'.
                 """
             )
@@ -2401,14 +2500,17 @@
         throw SyncEngine.SchemaError(
           reason: .cycleDetected,
           debugDescription: """
-            Cycles are not currently permitted in schemas, e.g. a table that references itself.
+            Cross-table cycles are not currently permitted in schemas.
             """
         )
       }
 
       marked.insert(table)
       for dependency in tableDependencies[table] ?? [] {
-        try visit(table: HashableSynchronizedTable(dependency))
+        let isSelfReference = dependency.base.tableName == table.type.base.tableName
+        if !isSelfReference {
+          try visit(table: HashableSynchronizedTable(dependency))
+        }
       }
       marked.remove(table)
       visited.insert(table)
