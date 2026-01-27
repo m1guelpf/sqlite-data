@@ -1270,5 +1270,50 @@
         }
         return record
       }
+
+      @Test func selfReferentialRecordsSentInCorrectOrder() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            LocalUser(id: 2, name: "Child", parentID: 1)
+            LocalUser(id: 1, name: "Parent", parentID: nil)
+          }
+        }
+
+        let batch = await syncEngine.nextRecordZoneChangeBatch(
+          syncEngine: syncEngine.private
+        )
+        let records = batch?.recordsToSave ?? []
+
+        let parentIndex = records.firstIndex { $0.recordID.recordName == "1:localUsers" }
+        let childIndex = records.firstIndex { $0.recordID.recordName == "2:localUsers" }
+        #expect(parentIndex != nil)
+        #expect(childIndex != nil)
+        #expect(parentIndex! < childIndex!)
+      }
+
+      @Test func deepHierarchySentInCorrectOrder() async throws {
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            LocalUser(id: 3, name: "Grandchild", parentID: 2)
+            LocalUser(id: 1, name: "Grandparent", parentID: nil)
+            LocalUser(id: 2, name: "Parent", parentID: 1)
+          }
+        }
+
+        let batch = await syncEngine.nextRecordZoneChangeBatch(
+          syncEngine: syncEngine.private
+        )
+        let records = batch?.recordsToSave ?? []
+
+        let grandparentIndex = records.firstIndex { $0.recordID.recordName == "1:localUsers" }
+        let parentIndex = records.firstIndex { $0.recordID.recordName == "2:localUsers" }
+        let grandchildIndex = records.firstIndex { $0.recordID.recordName == "3:localUsers" }
+
+        #expect(grandparentIndex != nil)
+        #expect(parentIndex != nil)
+        #expect(grandchildIndex != nil)
+        #expect(grandparentIndex! < parentIndex!)
+        #expect(parentIndex! < grandchildIndex!)
+      }
   }
 #endif

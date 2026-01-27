@@ -1113,6 +1113,71 @@
         }
       }
 
+      let selfReferentialTableNames = Set(
+        foreignKeysByTableName.compactMap { tableName, foreignKeys in
+          foreignKeys.contains { $0.table == tableName } ? tableName : nil
+        }
+      )
+
+      let selfRefSaveRecordIDs = changes.compactMap { change -> CKRecord.ID? in
+        guard case .saveRecord(let recordID) = change,
+              let tableName = recordID.tableName,
+              selfReferentialTableNames.contains(tableName)
+        else { return nil }
+        return recordID
+      }
+
+      if !selfRefSaveRecordIDs.isEmpty {
+        let selfRefRecordNames = Set(selfRefSaveRecordIDs.map(\.recordName))
+        let parentsByRecordName: [String: String?] =
+          await withErrorReporting(.sqliteDataCloudKitFailure) {
+            try await metadatabase.read { db in
+              try SyncMetadata
+                .where { $0.recordName.in(selfRefRecordNames) }
+                .fetchAll(db)
+            }
+          }?
+          .reduce(into: [:]) { $0[$1.recordName] = $1.parentRecordName } ?? [:]
+
+        func isAncestor(_ potentialAncestor: String, of record: String) -> Bool {
+          var current = parentsByRecordName[record] ?? nil
+          while let parent = current {
+            if parent == potentialAncestor { return true }
+            current = parentsByRecordName[parent] ?? nil
+          }
+          return false
+        }
+
+        changes.sort { lhs, rhs in
+          guard case .saveRecord(let lhsID) = lhs,
+                case .saveRecord(let rhsID) = rhs,
+                let lhsTable = lhsID.tableName,
+                let rhsTable = rhsID.tableName,
+                lhsTable == rhsTable,
+                selfReferentialTableNames.contains(lhsTable)
+          else {
+            return false
+          }
+
+          if isAncestor(lhsID.recordName, of: rhsID.recordName) {
+            return true
+          }
+          if isAncestor(rhsID.recordName, of: lhsID.recordName) {
+            return false
+          }
+
+          let lhsParent = parentsByRecordName[lhsID.recordName] ?? nil
+          let rhsParent = parentsByRecordName[rhsID.recordName] ?? nil
+
+          switch (lhsParent, rhsParent) {
+          case (nil, nil): return lhsID.recordName < rhsID.recordName
+          case (nil, _): return true
+          case (_, nil): return false
+          default: return lhsID.recordName < rhsID.recordName
+          }
+        }
+      }
+
       #if DEBUG
         let state = LockIsolated(NextRecordZoneChangeBatchLoggingState())
         defer {
