@@ -1651,24 +1651,14 @@
         return foreignKeys.contains { $0.table == record.recordType }
       }
 
+      let sortedModifications = hasSelfReferentialRecords
+        ? sortRecordsForDependencyOrder(modifications)
+        : modifications
+
       let shares: [ShareOrReference] =
         await withErrorReporting(.sqliteDataCloudKitFailure) {
-          if hasSelfReferentialRecords {
-            do {
-              return try await userDatabase.write { db in
-                try #sql("PRAGMA defer_foreign_keys = ON").execute(db)
-                return try processModifications(modifications, into: db)
-              }
-            } catch let error as DatabaseError where error.resultCode == .SQLITE_CONSTRAINT {
-              let sortedModifications = sortRecordsForDependencyOrder(modifications)
-              return try await userDatabase.write { db in
-                try processModifications(sortedModifications, into: db)
-              }
-            }
-          } else {
-            return try await userDatabase.write { db in
-              try processModifications(modifications, into: db)
-            }
+          try await userDatabase.write { db in
+            try processModifications(sortedModifications, into: db)
           }
         }
         ?? []

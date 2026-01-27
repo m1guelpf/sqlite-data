@@ -29,6 +29,12 @@
     let parentID: UUID?
   }
 
+  @Table struct UserActivity: Identifiable {
+    let id: Int
+    let userID: LocalUser.ID
+    let action: String
+  }
+
   @Suite(
     .snapshots(record: .missing),
     .dependencies {
@@ -1314,6 +1320,93 @@
         #expect(grandchildIndex != nil)
         #expect(grandparentIndex! < parentIndex!)
         #expect(parentIndex! < grandchildIndex!)
+      }
+
+      @Test func customTriggerReferencingParentWorksWithCloudKitSync() async throws {
+        try await userDatabase.write { db in
+          try #sql("""
+            CREATE TABLE IF NOT EXISTS "userActivities" (
+              "id" INTEGER PRIMARY KEY NOT NULL,
+              "userID" INTEGER NOT NULL REFERENCES "localUsers"("id"),
+              "action" TEXT NOT NULL
+            )
+            """).execute(db)
+
+          try #sql("""
+            CREATE TRIGGER IF NOT EXISTS "log_user_with_parent"
+            AFTER INSERT ON "localUsers"
+            WHEN NEW."parentID" IS NOT NULL
+            BEGIN
+              INSERT INTO "userActivities" ("id", "userID", "action")
+              VALUES (NEW."id", NEW."parentID", 'child_created');
+            END
+            """).execute(db)
+        }
+
+        let childRecord = makeUserRecord(id: 2, name: "Child", parentID: 1)
+        let parentRecord = makeUserRecord(id: 1, name: "Parent", parentID: nil)
+
+        try await syncEngine.modifyRecords(
+          scope: .private,
+          saving: [childRecord, parentRecord]
+        ).notify()
+
+        try await userDatabase.read { db in
+          let users = try LocalUser.order(by: \.id).fetchAll(db)
+          #expect(users.count == 2)
+          #expect(users[0].id == 1)
+          #expect(users[1].id == 2)
+
+          let activities = try #sql("SELECT * FROM userActivities", as: UserActivity.self)
+            .fetchAll(db)
+          #expect(activities.count == 1)
+          #expect(activities[0].userID == 1)
+          #expect(activities[0].action == "child_created")
+        }
+      }
+
+      @Test func customTriggerWorksWithDeepHierarchyFromCloudKit() async throws {
+        try await userDatabase.write { db in
+          try #sql("""
+            CREATE TABLE IF NOT EXISTS "userActivities" (
+              "id" INTEGER PRIMARY KEY NOT NULL,
+              "userID" INTEGER NOT NULL REFERENCES "localUsers"("id"),
+              "action" TEXT NOT NULL
+            )
+            """).execute(db)
+
+          try #sql("""
+            CREATE TRIGGER IF NOT EXISTS "log_user_with_parent"
+            AFTER INSERT ON "localUsers"
+            WHEN NEW."parentID" IS NOT NULL
+            BEGIN
+              INSERT INTO "userActivities" ("id", "userID", "action")
+              VALUES (NEW."id", NEW."parentID", 'child_created');
+            END
+            """).execute(db)
+        }
+
+        let grandchildRecord = makeUserRecord(id: 3, name: "Grandchild", parentID: 2)
+        let parentRecord = makeUserRecord(id: 2, name: "Parent", parentID: 1)
+        let grandparentRecord = makeUserRecord(id: 1, name: "Grandparent", parentID: nil)
+
+        try await syncEngine.modifyRecords(
+          scope: .private,
+          saving: [grandchildRecord, parentRecord, grandparentRecord]
+        ).notify()
+
+        try await userDatabase.read { db in
+          let users = try LocalUser.order(by: \.id).fetchAll(db)
+          #expect(users.count == 3)
+
+          let activities = try #sql("SELECT * FROM userActivities ORDER BY id", as: UserActivity.self)
+            .fetchAll(db)
+          #expect(activities.count == 2)
+          #expect(activities[0].id == 2)
+          #expect(activities[0].userID == 1)
+          #expect(activities[1].id == 3)
+          #expect(activities[1].userID == 2)
+        }
       }
   }
 #endif
