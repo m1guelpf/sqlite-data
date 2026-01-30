@@ -38,7 +38,7 @@
     private let notificationsObserver = LockIsolated<(any NSObjectProtocol)?>(nil)
     private let activityCounts = LockIsolated(ActivityCounts())
     private let startTask = LockIsolated<Task<Void, Never>?>(nil)
-    #if canImport(DeveloperToolsSupport)
+    #if DEBUG && canImport(DeveloperToolsSupport)
       private let previewTimerTask = LockIsolated<Task<Void, Never>?>(nil)
     #endif
 
@@ -91,7 +91,7 @@
       privateTables: repeat (each T2).Type,
       containerIdentifier: String? = nil,
       defaultZone: CKRecordZone = CKRecordZone(zoneName: "co.pointfree.SQLiteData.defaultZone"),
-      startImmediately: Bool = true,
+      startImmediately: Bool? = nil,
       delegate: (any SyncEngineDelegate)? = nil,
       logger: Logger = isTesting
         ? Logger(.disabled) : Logger(subsystem: "SQLiteData", category: "CloudKit")
@@ -152,7 +152,7 @@
           privateTables: allPrivateTables
         )
         try setUpSyncEngine()
-        if startImmediately {
+        if startImmediately ?? !isTesting {
           _ = try start()
         }
         return
@@ -201,7 +201,7 @@
         privateTables: allPrivateTables
       )
       try setUpSyncEngine()
-      if startImmediately {
+      if startImmediately ?? !isTesting {
         _ = try start()
       }
     }
@@ -423,7 +423,7 @@
     /// You must start the sync engine again using ``start()`` to synchronize the changes.
     public func stop() {
       guard isRunning else { return }
-      #if canImport(DeveloperToolsSupport)
+      #if DEBUG && canImport(DeveloperToolsSupport)
         previewTimerTask.withValue {
           $0?.cancel()
           $0 = nil
@@ -503,7 +503,7 @@
         }
       )
 
-      #if canImport(DeveloperToolsSupport)
+      #if DEBUG && canImport(DeveloperToolsSupport)
         @Dependency(\.context) var context
         @Dependency(\.continuousClock) var clock
         if context == .preview {
@@ -899,7 +899,15 @@
     /// See <doc:CloudKit#Updating-triggers-to-be-compatible-with-synchronization> for more info.
     @DatabaseFunction("sqlitedata_icloud_syncEngineIsSynchronizingChanges")
     public static var isSynchronizing: Bool {
-      _isSynchronizingChanges
+      if _isCreatingTemporaryTrigger {
+        reportIssue(
+          """
+          Invoked 'SyncEngine.isSynchronizing' at trigger creation, which is unexpected. Use \
+          'SyncEngine.$isSynchronizing' to invoke at trigger execution, instead.
+          """
+        )
+      }
+      return _isSynchronizingChanges
     }
 
     @available(*, deprecated, message: "Use 'SyncEngine.$isSynchronizing', instead.")
@@ -1246,14 +1254,17 @@
         }
         func open<T>(_: some SynchronizableTable<T>) async -> CKRecord? {
           let row =
-            withErrorReporting(.sqliteDataCloudKitFailure) {
-              try userDatabase.read { db in
-                try T
+            await withErrorReporting(.sqliteDataCloudKitFailure) {
+              // NB: Fake 'sending' result.
+              nonisolated(unsafe) var result: T.QueryOutput?
+              try await userDatabase.read { db in
+                result = try T
                   .where {
                     #sql("\($0.primaryKey) = \(bind: metadata.recordPrimaryKey)")
                   }
                   .fetchOne(db)
               }
+              return result
             }
             ?? nil
           guard let row
@@ -2043,8 +2054,12 @@
       db: Database
     ) {
       withErrorReporting(.sqliteDataCloudKitFailure) {
-        guard let recordPrimaryKey = serverRecord.recordID.recordPrimaryKey
-        else { return }
+        guard
+          let recordPrimaryKey = serverRecord.recordID.recordPrimaryKey,
+          serverRecord.encryptedValues[CKRecord.userModificationTimeKey] != nil
+        else {
+          return
+        }
 
         try SyncMetadata.insert {
           SyncMetadata(
@@ -2155,7 +2170,9 @@
     ) async throws -> QueryFragment {
       let nonPrimaryKeyChangedColumns =
         changedColumnNames
-        .filter { $0 != T.primaryKey.name }
+        .filter {
+          $0 != T.primaryKey.name && record.hasSet(key: $0)
+        }
       guard
         !nonPrimaryKeyChangedColumns.isEmpty
       else {
@@ -2581,7 +2598,9 @@
       self.lastKnownServerRecord = lastKnownServerRecord
       self._lastKnownServerRecordAllFields = lastKnownServerRecord
       if let lastKnownServerRecord {
-        self.userModificationTime = lastKnownServerRecord.userModificationTime
+        self.userModificationTime = #sql("""
+          max(\(self.userModificationTime), \(lastKnownServerRecord.userModificationTime))
+          """)
       }
     }
   }
@@ -2592,13 +2611,19 @@
     record: CKRecord,
     columnNames: some Collection<String>
   ) -> QueryFragment {
-    let allColumnNames = T.TableColumns.writableColumns.map(\.name)
+    let setColumnNames = T.TableColumns.writableColumns.map(\.name)
+      .filter { record.hasSet(key: $0) }
+    guard !setColumnNames.isEmpty
+    else {
+      return ""
+    }
+    let columnNames = columnNames.filter { setColumnNames.contains($0) }
     let hasNonPrimaryKeyColumns = columnNames.contains { $0 != T.primaryKey.name }
     var query: QueryFragment = "INSERT INTO \(T.self) ("
-    query.append(allColumnNames.map { "\(quote: $0)" }.joined(separator: ", "))
+    query.append(setColumnNames.map { "\(quote: $0)" }.joined(separator: ", "))
     query.append(") VALUES (")
     query.append(
-      allColumnNames
+      setColumnNames
         .map { columnName in
           if let asset = record[columnName] as? CKAsset {
             @Dependency(\.dataManager) var dataManager

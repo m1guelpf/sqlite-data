@@ -307,14 +307,14 @@
           """
         }
         assertInlineSnapshot(of: error, as: .customDump) {
-          """
+          #"""
           SyncEngine.SharingError(
             recordTableName: "remindersLists",
             recordPrimaryKey: "1",
             reason: .recordMetadataNotFound,
-            debugDescription: "No sync metadata found for record. Has the record been saved to the database?"
+            debugDescription: "No sync metadata found for record. Has the record been saved to the database and synchronized to iCloud? Invoke \'SyncEngine.sendChanges()\' to force synchronization."
           )
-          """
+          """#
         }
       }
 
@@ -1592,6 +1592,7 @@
           recordType: ModelA.tableName,
           recordID: ModelA.recordID(for: 1, zoneID: externalZone.zoneID)
         )
+        modelARecord.setValue(1, forKey: "id", at: now)
         modelARecord.setValue(42, forKey: "count", at: now)
 
         let share = CKShare(
@@ -1657,7 +1658,8 @@
                   recordType: "modelAs",
                   parent: nil,
                   share: CKReference(recordID: CKRecord.ID(share-1:modelAs/external.zone/external.owner)),
-                  count: 42
+                  count: 42,
+                  id: 1
                 ),
                 [1]: CKRecord(
                   recordID: CKRecord.ID(1:modelBs/external.zone/external.owner),
