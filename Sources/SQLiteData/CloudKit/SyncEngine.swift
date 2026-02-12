@@ -106,7 +106,7 @@
       let containerIdentifier =
         containerIdentifier
         ?? ModelConfiguration(groupContainer: .automatic).cloudKitContainerIdentifier
-        ?? (context == .preview ? "preview" : nil)
+        ?? (context != .live ? "container" : nil)
       var allTables: [any SynchronizableTable] = []
       var allPrivateTables: [any SynchronizableTable] = []
       for table in repeat each tables {
@@ -2364,7 +2364,7 @@
       let containerIdentifier =
         containerIdentifier
         ?? ModelConfiguration(groupContainer: .automatic).cloudKitContainerIdentifier
-        ?? (context == .preview ? "preview" : nil)
+        ?? (context != .live ? "container" : nil)
 
       guard let containerIdentifier else {
         throw SyncEngine.SchemaError.noCloudKitContainer
@@ -2393,7 +2393,7 @@
         url.isInMemory
         ? try DatabaseQueue(path: path)
         : try DatabasePool(path: path)
-      _ = try database.write { db in
+      _ = try database.read { db in
         try #sql("SELECT 1").execute(db)
       }
       try #sql(
